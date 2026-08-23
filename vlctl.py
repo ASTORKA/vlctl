@@ -235,6 +235,17 @@ def xray_config(p, socks_port, http_port, log_level="warning"):
 
 # ---------------------------------------------------------------- конфиг sing-box (TUN)
 
+def tun_unsupported(p):
+    """sing-box умеет не всё, что умеет xray. -> текст проблемы или None."""
+    if p["net"] in ("xhttp", "splithttp"):
+        return ("sing-box не поддерживает транспорт xhttp — TUN-режим для этого сервера недоступен.\n"
+                "  Используй пункт 1 (SOCKS5 на xray-core), он с xhttp работает.")
+    if p["net"] in ("tcp", "raw") and p["headerType"] == "http":
+        return ("sing-box не поддерживает маскировку headerType=http — TUN-режим недоступен.\n"
+                "  Используй пункт 1 (SOCKS5 на xray-core).")
+    return None
+
+
 def singbox_outbound(p):
     o = {
         "type": "vless",
@@ -271,11 +282,28 @@ def singbox_outbound(p):
     return o
 
 
-def singbox_config(p, dns="1.1.1.1", log_level="warn"):
-    """Формат sing-box 1.11+ (rule actions). Ставится через `vlctl install --sing-box`."""
-    return {
-        "log": {"level": log_level, "timestamp": True},
-        "dns": {
+def singbox_version(binary):
+    """(major, minor) установленного sing-box; (1, 12) если распознать не вышло."""
+    try:
+        out = subprocess.run([binary, "version"], capture_output=True, timeout=10).stdout.decode(errors="replace")
+    except Exception:
+        return (1, 12)
+    m = re.search(r"version (\d+)\.(\d+)", out)
+    return (int(m.group(1)), int(m.group(2))) if m else (1, 12)
+
+
+def singbox_config(p, dns="1.1.1.1", log_level="warn", modern=True):
+    """modern=True — формат sing-box 1.12+; False — legacy (1.11 и старее)."""
+    if modern:
+        dns_block = {
+            "servers": [
+                {"type": "udp", "tag": "remote", "server": dns, "detour": "proxy"},
+                {"type": "local", "tag": "local"},
+            ],
+            "final": "remote",
+        }
+    else:
+        dns_block = {
             "servers": [
                 {"tag": "remote", "address": dns, "detour": "proxy"},
                 {"tag": "local", "address": "local", "detour": "direct"},
@@ -283,7 +311,24 @@ def singbox_config(p, dns="1.1.1.1", log_level="warn"):
             "rules": [{"outbound": "any", "server": "local"}],
             "strategy": "prefer_ipv4",
             "final": "remote",
-        },
+        }
+
+    route = {
+        "rules": [
+            {"action": "sniff"},
+            {"protocol": "dns", "action": "hijack-dns"},
+            {"ip_is_private": True, "outbound": "direct"},
+        ],
+        "final": "proxy",
+        "auto_detect_interface": True,
+    }
+    if modern:
+        # Адрес сервера — домен, его нужно резолвить в обход туннеля.
+        route["default_domain_resolver"] = {"server": "local"}
+
+    return {
+        "log": {"level": log_level, "timestamp": True},
+        "dns": dns_block,
         "inbounds": [{
             "type": "tun",
             "tag": "tun-in",
@@ -297,15 +342,7 @@ def singbox_config(p, dns="1.1.1.1", log_level="warn"):
             singbox_outbound(p),
             {"type": "direct", "tag": "direct"},
         ],
-        "route": {
-            "rules": [
-                {"action": "sniff"},
-                {"protocol": "dns", "action": "hijack-dns"},
-                {"ip_is_private": True, "outbound": "direct"},
-            ],
-            "final": "proxy",
-            "auto_detect_interface": True,
-        },
+        "route": route,
     }
 
 
@@ -514,8 +551,7 @@ def write_tmp_config(cfg, prefix):
     return path
 
 
-def _run(cmd, env=None, grace=5):
-    proc = subprocess.Popen(cmd, env=env)
+def _wait(proc, grace=5):
     try:
         proc.wait()
     except KeyboardInterrupt:
@@ -528,6 +564,39 @@ def _run(cmd, env=None, grace=5):
     return proc.returncode or 0
 
 
+def _run(cmd, env=None, grace=5):
+    return _wait(subprocess.Popen(cmd, env=env), grace)
+
+
+def wait_port(port, seconds=5.0):
+    for _ in range(int(seconds * 10)):
+        time.sleep(0.1)
+        s = socket.socket()
+        s.settimeout(0.2)
+        up = s.connect_ex(("127.0.0.1", port)) == 0
+        s.close()
+        if up:
+            return True
+    return False
+
+
+def probe_ip(port, timeout=15):
+    """Что видит внешний мир через SOCKS на этом порту. -> (текст, мс) или (None, ошибка)."""
+    t0 = time.time()
+    r = subprocess.run(["curl", "-s", "--max-time", str(timeout),
+                        "-x", "socks5h://127.0.0.1:%d" % port,
+                        "https://ifconfig.co/json"], capture_output=True)
+    dt = (time.time() - t0) * 1000
+    if r.returncode != 0 or not r.stdout.strip():
+        return None, "curl rc=%d" % r.returncode
+    try:
+        d = json.loads(r.stdout)
+        return "ip=%s  страна=%s %s  (%.0f мс)" % (d.get("ip"), d.get("country", "?"),
+                                                   d.get("city", ""), dt), dt
+    except ValueError:
+        return r.stdout[:200].decode(errors="replace"), dt
+
+
 def run_socks(p, o):
     xray = need_bin("xray")
     sp = free_port(o.socks_port)
@@ -538,28 +607,55 @@ def run_socks(p, o):
 
     info("сервер: %s (%s)" % (p["name"], describe(p)))
     info("SOCKS5: 127.0.0.1:%d%s" % (sp, " | HTTP: 127.0.0.1:%d" % hp if hp else ""))
-    print("""
+    proc = subprocess.Popen([xray, "run", "-c", path], env=env)
+    try:
+        if wait_port(sp):
+            txt, _ = probe_ip(sp)
+            if txt:
+                info("через прокси: %s" % txt)
+            else:
+                warn("прокси поднялся, но наружу не ходит — проверь ссылку (%s)" % _)
+        print("""
+  %s
+  IP в браузере и в `curl` без прокси НЕ изменится: это прокси, а не VPN.
+  Чтобы через туннель шло всё сразу — пункт 2 меню (VPN-режим, TUN).
+
   В терминале:
     export ALL_PROXY=socks5h://127.0.0.1:%d
     export HTTP_PROXY=http://127.0.0.1:%d HTTPS_PROXY=http://127.0.0.1:%d
-  В браузере: SOCKS5 127.0.0.1:%d, включи «DNS через прокси».
+  В Firefox: Настройки -> Сеть -> Вручную -> SOCKS5 127.0.0.1 порт %d,
+             галочка «Проксировать DNS при использовании SOCKS v5».
+  В Chrome:  google-chrome --proxy-server="socks5://127.0.0.1:%d"
+
   Остановить: Ctrl+C
-""" % (sp, hp or sp, hp or sp, sp))
-    try:
-        return _run([xray, "run", "-c", path], env=env)
+""" % (bold("Работает только для приложений, которым указан этот прокси."),
+       sp, hp or sp, hp or sp, sp, sp))
+        return _wait(proc)
     finally:
         os.unlink(path)
 
 
 def run_tun(p, o):
+    bad = tun_unsupported(p)
+    if bad:
+        warn(bad)
+        return 1
     sb = need_bin("sing-box")
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         info("режим TUN требует root, перезапускаюсь через sudo…")
+        fd, lf = tempfile.mkstemp(prefix="vlctl-link-")
+        os.write(fd, p["raw"].encode())
+        os.close(fd)
+        os.chmod(lf, 0o600)
         os.execvp("sudo", ["sudo", "-E", sys.executable, os.path.abspath(__file__),
-                           "up", "--tun", p["raw"]])
-    path = write_tmp_config(singbox_config(p, o.dns, "info" if o.verbose else "warn"), "vlctl-sb-")
+                           "up", "--tun", "--link-file", lf])
+
+    ver = singbox_version(sb)
+    cfg = singbox_config(p, o.dns, "info" if o.verbose else "warn", modern=ver >= (1, 12))
+    path = write_tmp_config(cfg, "vlctl-sb-")
     info("сервер: %s (%s)" % (p["name"], describe(p)))
-    info("режим TUN: весь трафик системы идёт через VPN. Остановить — Ctrl+C")
+    info("ядро: sing-box %d.%d, режим TUN — весь трафик системы идёт через VPN. Остановить — Ctrl+C"
+         % ver)
     try:
         return _run([sb, "run", "-c", path], grace=10)
     finally:
@@ -581,34 +677,15 @@ def check(p, o=None):
     proc = subprocess.Popen([xray, "run", "-c", path],
                             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
-        for _ in range(50):
-            time.sleep(0.1)
-            s = socket.socket()
-            s.settimeout(0.2)
-            up = s.connect_ex(("127.0.0.1", sp)) == 0
-            s.close()
-            if up:
-                break
-        else:
-            err = proc.stderr.read().decode(errors="replace")[-800:]
-            warn("ядро не поднялось:\n%s" % err)
+        if not wait_port(sp):
+            warn("ядро не поднялось:\n%s" % proc.stderr.read().decode(errors="replace")[-800:])
             return 1
-
         info("проверяю выход через «%s»…" % p["name"])
-        t0 = time.time()
-        r = subprocess.run(["curl", "-s", "--max-time", "15",
-                            "-x", "socks5h://127.0.0.1:%d" % sp,
-                            "https://ifconfig.co/json"], capture_output=True)
-        dt = (time.time() - t0) * 1000
-        if r.returncode != 0 or not r.stdout.strip():
-            warn("не удалось выйти в сеть через прокси (curl rc=%d)" % r.returncode)
+        txt, err = probe_ip(sp)
+        if not txt:
+            warn("не удалось выйти в сеть через прокси (%s)" % err)
             return 1
-        try:
-            d = json.loads(r.stdout)
-            print("%s  ip=%s  страна=%s %s  (%.0f мс)"
-                  % (_c("32", "OK"), d.get("ip"), d.get("country", "?"), d.get("city", ""), dt))
-        except ValueError:
-            print("%s  ответ: %s" % (_c("32", "OK"), r.stdout[:200].decode(errors="replace")))
+        print("%s  %s" % (_c("32", "OK"), txt))
         return 0
     finally:
         proc.terminate()
@@ -658,12 +735,12 @@ def ui_profile(name):
         print()
         print(bold("  %s" % name) + dim("   %s" % describe(p)))
         print("""    1) Подключиться   — SOCKS5 на 127.0.0.1 (без root)
-    2) VPN-режим      — весь трафик системы через TUN (нужен root)
+    2) VPN-режим      — весь трафик системы через TUN (нужен root)%s
     3) Проверить      — какой IP видит внешний мир
     4) Переименовать
     5) Показать ссылку и конфиг
     6) Удалить
-    0) Назад""")
+    0) Назад""" % ("" if not tun_unsupported(p) else dim("  [недоступно для этого сервера]")))
         ch = ask("Выбор", "1")
 
         if ch == "1":
@@ -794,13 +871,23 @@ def import_subscription(src):
 
 
 def cmd_up(a):
-    p = resolve(a.target)
-    if a.target.startswith("vless://") and sys.stdin.isatty():
-        known = a.target.strip() in load_store()["profiles"].values()
-        if not known:
+    target = a.target
+    if getattr(a, "link_file", None):
+        with open(a.link_file, "r", encoding="utf-8") as f:
+            target = f.read().strip()
+        try:
+            os.unlink(a.link_file)
+        except OSError:
+            pass
+    if not target:
+        die("нужна ссылка vless:// или имя профиля")
+
+    p = resolve(target)
+    if target.startswith("vless://") and sys.stdin.isatty() and not getattr(a, "link_file", None):
+        if target.strip() not in load_store()["profiles"].values():
             try:
                 if confirm("Сохранить эту ссылку в профили?", True):
-                    saved = add_profile(a.target, ask("Название", p["name"]))
+                    saved = add_profile(target, ask("Название", p["name"]))
                     info("сохранено: «%s»" % saved)
             except Abort:
                 pass
@@ -813,7 +900,11 @@ def cmd_test(a):
 
 def cmd_config(a):
     p = resolve(a.target)
-    cfg = singbox_config(p, a.dns) if a.tun else xray_config(p, a.socks_port, a.http_port)
+    if a.tun:
+        sb = find_bin("sing-box")
+        cfg = singbox_config(p, a.dns, modern=(singbox_version(sb) >= (1, 12)) if sb else True)
+    else:
+        cfg = xray_config(p, a.socks_port, a.http_port)
     print(json.dumps(cfg, ensure_ascii=False, indent=2))
     return 0
 
@@ -891,8 +982,9 @@ def build_parser():
         sp.add_argument("-v", "--verbose", action="store_true")
 
     s = sub.add_parser("up", help="поднять подключение")
-    s.add_argument("target", help="vless://... или имя профиля")
+    s.add_argument("target", nargs="?", help="vless://... или имя профиля")
     s.add_argument("--tun", action="store_true", help="весь трафик системы через VPN (sing-box, root)")
+    s.add_argument("--link-file", help=argparse.SUPPRESS)  # внутреннее: передача ссылки под sudo
     common(s)
     s.set_defaults(func=cmd_up)
 
