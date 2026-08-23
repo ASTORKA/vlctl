@@ -409,6 +409,11 @@ def resolve(arg):
     profs = load_store()["profiles"]
     if arg in profs:
         return parse_link(profs[arg])
+    if arg.isdigit():  # номер строки из `vlctl ls` — чтобы не набирать имя руками
+        idx = int(arg)
+        names = list(profs)
+        if 1 <= idx <= len(names):
+            return parse_link(profs[names[idx - 1]])
     matches = [k for k in profs if arg.lower() in k.lower()]
     if len(matches) == 1:
         return parse_link(profs[matches[0]])
@@ -1026,10 +1031,10 @@ def cmd_ls(a=None):
         print("профилей нет (vlctl save <имя> <ссылка>, vlctl import <url> или просто vlctl)")
         return 0
     width = max(len(k) for k in profs)
-    for name, link in profs.items():
+    for i, (name, link) in enumerate(profs.items(), 1):
         p = parse_link(link)
         mark = " ←последнее" if name == store.get("last") else ""
-        print("%-*s  %-34s  %s%s" % (width, name, describe(p), p["name"], mark))
+        print("%2d) %-*s  %-34s  %s%s" % (i, width, name, describe(p), p["name"], mark))
     return 0
 
 
