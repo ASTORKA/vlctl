@@ -191,7 +191,7 @@ def xray_stream(p):
     return ss
 
 
-def xray_config(p, socks_port, http_port, log_level="warning"):
+def xray_config(p, socks_port, http_port, log_level="warning", pin_ip=None):
     user = {"id": p["uuid"], "encryption": "none"}
     if p["flow"]:
         user["flow"] = p["flow"]
@@ -220,7 +220,7 @@ def xray_config(p, socks_port, http_port, log_level="warning"):
             {
                 "tag": "proxy",
                 "protocol": "vless",
-                "settings": {"vnext": [{"address": p["host"], "port": p["port"], "users": [user]}]},
+                "settings": {"vnext": [{"address": pin_ip or p["host"], "port": p["port"], "users": [user]}]},
                 "streamSettings": xray_stream(p),
             },
             {"tag": "direct", "protocol": "freedom"},
@@ -290,6 +290,68 @@ def singbox_version(binary):
         return (1, 12)
     m = re.search(r"version (\d+)\.(\d+)", out)
     return (int(m.group(1)), int(m.group(2))) if m else (1, 12)
+
+
+def _sb_dns(dns, modern, via_tcp=False):
+    if modern:
+        return {
+            "servers": [
+                {"type": "tcp" if via_tcp else "udp", "tag": "remote", "server": dns, "detour": "proxy"},
+                {"type": "local", "tag": "local"},
+            ],
+            "final": "remote",
+        }
+    return {
+        "servers": [
+            {"tag": "remote", "address": ("tcp://" if via_tcp else "") + dns, "detour": "proxy"},
+            {"tag": "local", "address": "local", "detour": "direct"},
+        ],
+        "rules": [{"outbound": "any", "server": "local"}],
+        "strategy": "prefer_ipv4",
+        "final": "remote",
+    }
+
+
+def _sb_route(modern, direct_ips=()):
+    rules = [
+        {"action": "sniff"},
+        {"protocol": "dns", "action": "hijack-dns"},
+        {"ip_is_private": True, "outbound": "direct"},
+    ]
+    if direct_ips:
+        # Трафик к самому VPN-серверу мимо туннеля, иначе получится петля.
+        rules.append({"ip_cidr": ["%s/%d" % (ip, 128 if ":" in ip else 32) for ip in direct_ips],
+                      "outbound": "direct"})
+    route = {"rules": rules, "final": "proxy", "auto_detect_interface": True}
+    if modern:
+        route["default_domain_resolver"] = {"server": "local"}
+    return route
+
+
+TUN_INBOUND = {
+    "type": "tun",
+    "tag": "tun-in",
+    "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+    "mtu": 1500,
+    "auto_route": True,
+    "strict_route": True,
+    "stack": "system",
+}
+
+
+def singbox_tun2socks_config(socks_port, direct_ips, dns="1.1.1.1", log_level="warn", modern=True):
+    """sing-box только гоняет пакеты: TUN -> локальный SOCKS от xray. Протокол делает xray."""
+    return {
+        "log": {"level": log_level, "timestamp": True},
+        "dns": _sb_dns(dns, modern, via_tcp=True),
+        "inbounds": [dict(TUN_INBOUND)],
+        "outbounds": [
+            {"type": "socks", "tag": "proxy", "server": "127.0.0.1",
+             "server_port": socks_port, "version": "5"},
+            {"type": "direct", "tag": "direct"},
+        ],
+        "route": _sb_route(modern, direct_ips),
+    }
 
 
 def singbox_config(p, dns="1.1.1.1", log_level="warn", modern=True):
@@ -522,18 +584,20 @@ def install_core(sing_box=False):
 class Opts(object):
     """Настройки запуска: и из argparse, и из интерактивного меню."""
 
-    def __init__(self, socks_port=10808, http_port=10809, dns="1.1.1.1", verbose=False, tun=False):
+    def __init__(self, socks_port=10808, http_port=10809, dns="1.1.1.1", verbose=False,
+                 tun=False, native=False):
         self.socks_port = socks_port
         self.http_port = http_port
         self.dns = dns
         self.verbose = verbose
         self.tun = tun
+        self.native = native
 
     @classmethod
     def from_args(cls, a):
         return cls(getattr(a, "socks_port", 10808), getattr(a, "http_port", 10809),
                    getattr(a, "dns", "1.1.1.1"), getattr(a, "verbose", False),
-                   getattr(a, "tun", False))
+                   getattr(a, "tun", False), getattr(a, "native", False))
 
 
 def free_port(preferred):
@@ -643,27 +707,109 @@ def run_socks(p, o):
         os.unlink(path)
 
 
+def resolve_server_ips(p):
+    """IP-адреса сервера: их надо и прибить в xray, и исключить из туннеля."""
+    try:
+        infos = socket.getaddrinfo(p["host"], p["port"], proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        warn("не удалось разрешить %s: %s" % (p["host"], e))
+        return []
+    ips = []
+    for _, _, _, _, sa in infos:
+        if sa[0] not in ips:
+            ips.append(sa[0])
+    return ips
+
+
+def _sudo_restart(p, o):
+    """Перезапуск под root: ссылка идёт файлом, а не в argv — иначе видна в ps."""
+    info("режим TUN требует root, перезапускаюсь через sudo…")
+    fd, lf = tempfile.mkstemp(prefix="vlctl-link-")
+    os.write(fd, p["raw"].encode())
+    os.close(fd)
+    os.chmod(lf, 0o600)
+    argv = ["sudo", "-E", sys.executable, os.path.abspath(__file__), "up", "--tun", "--link-file", lf]
+    if o.native:
+        argv.append("--native")
+    if o.verbose:
+        argv.append("-v")
+    os.execvp("sudo", argv)
+
+
 def run_tun(p, o):
+    """TUN поверх xray: протокол делает xray, sing-box работает как tun2socks."""
+    if o.native:
+        return run_tun_native(p, o)
+    xray = need_bin("xray")
+    sb = need_bin("sing-box")
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        _sudo_restart(p, o)
+
+    ips = resolve_server_ips(p)
+    if not ips:
+        return 1
+    pin = None
+    for ip in ips:
+        ok, _, _ = tcp_reachable(ip, p["port"], 6)
+        if ok:
+            pin = ip
+            break
+    if not pin:
+        warn("сервер %s:%s недоступен ни по одному адресу (%s)" % (p["host"], p["port"], ", ".join(ips)))
+        return 1
+
+    sp = free_port(o.socks_port)
+    xcfg = write_tmp_config(xray_config(p, sp, 0, "info" if o.verbose else "warning", pin_ip=pin),
+                            "vlctl-xray-")
+    env = dict(os.environ)
+    env.setdefault("XRAY_LOCATION_ASSET", BIN_DIR)
+    info("сервер: %s (%s, %s)" % (p["name"], describe(p), pin))
+    xproc = subprocess.Popen([xray, "run", "-c", xcfg], env=env,
+                             stdout=None if o.verbose else subprocess.DEVNULL)
+    try:
+        if not wait_port(sp):
+            warn("xray не поднялся, TUN не включаю")
+            return 1
+        txt, err = probe_ip(sp)
+        if not txt:
+            warn("туннель не работает (%s) — TUN не включаю, чтобы не оставить систему без сети" % err)
+            return 1
+        info("туннель проверен: %s" % txt)
+
+        ver = singbox_version(sb)
+        scfg = write_tmp_config(
+            singbox_tun2socks_config(sp, [pin], o.dns, "info" if o.verbose else "warn",
+                                     modern=ver >= (1, 12)),
+            "vlctl-sb-")
+        info("поднимаю TUN (sing-box %d.%d как tun2socks). Остановить — Ctrl+C" % ver)
+        try:
+            return _wait(subprocess.Popen([sb, "run", "-c", scfg]), grace=10)
+        finally:
+            os.unlink(scfg)
+    finally:
+        xproc.terminate()
+        try:
+            xproc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            xproc.kill()
+        os.unlink(xcfg)
+
+
+def run_tun_native(p, o):
+    """Старый путь: sing-box сам говорит на VLESS. Оставлен на случай, когда так удобнее."""
     bad = tun_unsupported(p)
     if bad:
         warn(bad)
         return 1
     sb = need_bin("sing-box")
     if hasattr(os, "geteuid") and os.geteuid() != 0:
-        info("режим TUN требует root, перезапускаюсь через sudo…")
-        fd, lf = tempfile.mkstemp(prefix="vlctl-link-")
-        os.write(fd, p["raw"].encode())
-        os.close(fd)
-        os.chmod(lf, 0o600)
-        os.execvp("sudo", ["sudo", "-E", sys.executable, os.path.abspath(__file__),
-                           "up", "--tun", "--link-file", lf])
+        _sudo_restart(p, o)
 
     ver = singbox_version(sb)
     cfg = singbox_config(p, o.dns, "info" if o.verbose else "warn", modern=ver >= (1, 12))
     path = write_tmp_config(cfg, "vlctl-sb-")
     info("сервер: %s (%s)" % (p["name"], describe(p)))
-    info("ядро: sing-box %d.%d, режим TUN — весь трафик системы идёт через VPN. Остановить — Ctrl+C"
-         % ver)
+    info("ядро: sing-box %d.%d (нативный VLESS), режим TUN. Остановить — Ctrl+C" % ver)
     try:
         return _run([sb, "run", "-c", path], grace=10)
     finally:
@@ -827,13 +973,13 @@ def ui_profile(name):
         print()
         print(bold("  %s" % name) + dim("   %s" % describe(p)))
         print("""    1) Подключиться   — SOCKS5 на 127.0.0.1 (без root)
-    2) VPN-режим      — весь трафик системы через TUN (нужен root)%s
+    2) VPN-режим      — весь трафик системы через TUN (нужен root)
     3) Проверить      — какой IP видит внешний мир
     4) Переименовать
     5) Показать ссылку и конфиг
     6) Удалить
     7) Диагностика   — часы, ядра, доступность сервера
-    0) Назад""" % ("" if not tun_unsupported(p) else dim("  [недоступно для этого сервера]")))
+    0) Назад""")
         ch = ask("Выбор", "1")
 
         if ch == "1":
@@ -1079,6 +1225,8 @@ def build_parser():
     s = sub.add_parser("up", help="поднять подключение")
     s.add_argument("target", nargs="?", help="vless://... или имя профиля")
     s.add_argument("--tun", action="store_true", help="весь трафик системы через VPN (sing-box, root)")
+    s.add_argument("--native", action="store_true",
+                   help="TUN нативным VLESS в sing-box вместо связки xray+tun2socks")
     s.add_argument("--link-file", help=argparse.SUPPRESS)  # внутреннее: передача ссылки под sudo
     common(s)
     s.set_defaults(func=cmd_up)
