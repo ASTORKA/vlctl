@@ -614,7 +614,10 @@ def run_socks(p, o):
             if txt:
                 info("через прокси: %s" % txt)
             else:
-                warn("прокси поднялся, но наружу не ходит — проверь ссылку (%s)" % _)
+                warn("прокси поднялся, но наружу не ходит (%s)" % _)
+                sk = clock_skew()
+                if sk is not None and abs(sk) > 60:
+                    warn("часы разошлись на %.0f с — REALITY этого не прощает, поправь время" % sk)
         print("""
   %s
   IP в браузере и в `curl` без прокси НЕ изменится: это прокси, а не VPN.
@@ -696,6 +699,90 @@ def check(p, o=None):
         os.unlink(path)
 
 
+def clock_skew():
+    """Насколько локальные часы разошлись с сервером времени, в секундах. None — не выяснилось."""
+    try:
+        r = subprocess.run(["curl", "-sI", "--max-time", "8", "https://www.google.com/"],
+                           capture_output=True)
+        m = re.search(rb"(?im)^date:\s*(.+)$", r.stdout)
+        if not m:
+            return None
+        from email.utils import parsedate_to_datetime
+        import datetime
+        server = parsedate_to_datetime(m.group(1).decode().strip())
+        return (datetime.datetime.now(datetime.timezone.utc) - server).total_seconds()
+    except Exception:
+        return None
+
+
+def tcp_reachable(host, port, timeout=6):
+    """(True, ip, мс) если TCP-соединение установилось."""
+    t0 = time.time()
+    try:
+        s = socket.create_connection((host, port), timeout)
+        ip = s.getpeername()[0]
+        s.close()
+        return True, ip, (time.time() - t0) * 1000
+    except socket.gaierror as e:
+        return False, "DNS: %s" % e, 0
+    except Exception as e:
+        return False, str(e), 0
+
+
+def doctor(p=None):
+    """Проверить всё, что обычно ломает подключение."""
+    print()
+    print(bold("Часы"))
+    skew = clock_skew()
+    if skew is None:
+        warn("не удалось сверить время (нет прямого доступа в сеть?)")
+    elif abs(skew) > 60:
+        print("  %s расхождение %.0f с — REALITY отвергнет клиента (в хендшейк зашита метка времени)."
+              % (_c("31", "ПРОБЛЕМА:"), skew))
+        print("    sudo systemctl restart systemd-timesyncd  # или: sudo ntpdate -u pool.ntp.org")
+    else:
+        print("  ок, расхождение %.1f с" % skew)
+
+    print(bold("Ядра"))
+    for name in ("xray", "sing-box"):
+        b = find_bin(name)
+        if not b:
+            print("  %s: не установлен" % name)
+            continue
+        try:
+            v = subprocess.run([b, "version"], capture_output=True, timeout=10).stdout
+            v = v.decode(errors="replace").splitlines()[0].strip()
+        except Exception:
+            v = "?"
+        print("  %s: %s (%s)" % (name, v, b))
+
+    print(bold("TUN"))
+    if platform.system().lower() == "linux":
+        print("  /dev/net/tun: %s" % ("есть" if os.path.exists("/dev/net/tun") else
+                                      _c("31", "нет — sudo modprobe tun")))
+
+    if p:
+        print(bold("Сервер %s" % p["name"]))
+        ok, detail, ms = tcp_reachable(p["host"], p["port"])
+        if ok:
+            print("  TCP %s:%s — доступен (%s, %.0f мс)" % (p["host"], p["port"], detail, ms))
+        else:
+            print("  %s TCP %s:%s — %s" % (_c("31", "ПРОБЛЕМА:"), p["host"], p["port"], detail))
+        miss = [k for k in ("pbk",) if p["security"] == "reality" and not p[k]]
+        if miss:
+            print("  %s в ссылке нет %s" % (_c("31", "ПРОБЛЕМА:"), ", ".join(miss)))
+        if p["security"] == "reality" and not p["sid"]:
+            print("  sid в ссылке пуст — норма, если сервер настроен на пустой shortId")
+        print("  sni=%s fp=%s flow=%s" % (p["sni"] or "-", p["fp"], p["flow"] or "-"))
+        print()
+        if find_bin("xray"):
+            check(p)
+        else:
+            warn("xray не установлен — проверку туннеля пропускаю (vlctl install)")
+    print()
+    return 0
+
+
 # ---------------------------------------------------------------- интерактивное меню
 
 def ui_new_link(preset=None):
@@ -740,6 +827,7 @@ def ui_profile(name):
     4) Переименовать
     5) Показать ссылку и конфиг
     6) Удалить
+    7) Диагностика   — часы, ядра, доступность сервера
     0) Назад""" % ("" if not tun_unsupported(p) else dim("  [недоступно для этого сервера]")))
         ch = ask("Выбор", "1")
 
@@ -778,6 +866,8 @@ def ui_profile(name):
                 save_store(store)
                 info("удалено")
                 return True
+        elif ch == "7":
+            doctor(p)
         elif ch == "0":
             return True
         else:
@@ -1019,6 +1109,10 @@ def build_parser():
     s = sub.add_parser("rm", help="удалить профиль")
     s.add_argument("name")
     s.set_defaults(func=cmd_rm)
+
+    s = sub.add_parser("doctor", help="диагностика: часы, ядра, доступность сервера")
+    s.add_argument("target", nargs="?")
+    s.set_defaults(func=lambda a: doctor(resolve(a.target) if a.target else None))
 
     s = sub.add_parser("install", help="скачать ядро в ~/.local/share/vlctl/bin")
     s.add_argument("--sing-box", action="store_true", help="ставить sing-box (для --tun) вместо xray")
