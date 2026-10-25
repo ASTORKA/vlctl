@@ -68,7 +68,8 @@ vlctl save <имя> <ссылка>
 vlctl rename <старое> <новое>
 vlctl rm <имя>
 vlctl ls
-vlctl import <url|файл>                  # подписка: список ссылок или base64
+vlctl import <url|файл> [--replace]      # подписка: список ссылок или base64; хосты той же подписки обновляются,
+                                         # --replace удаляет и остальные профили
 vlctl doctor [профиль]                   # часы, ядра, /dev/net/tun, доступность сервера
 vlctl install [--sing-box]
 ```

@@ -15,7 +15,7 @@ vlctl — CLI-клиент для vless:// ссылок (VLESS / REALITY / XTLS-
   vlctl test <ссылка|профиль>             проверить, куда выходит трафик
   vlctl config <ссылка|профиль> [--tun]   напечатать JSON-конфиг ядра
   vlctl save <имя> <ссылка> | vlctl rename <старое> <новое> | vlctl rm <имя>
-  vlctl import <url|файл>                 импортировать подписку
+  vlctl import <url|файл> [--replace]     импортировать подписку
   vlctl ls
   vlctl install [--sing-box]              скачать ядро в ~/.local/share/vlctl/bin
 """
@@ -1080,7 +1080,8 @@ def ui_main(preset_link=None):
 
 # ---------------------------------------------------------------- команды CLI
 
-def import_subscription(src):
+def fetch_subscription(src):
+    """URL или файл -> список vless:// ссылок."""
     if re.match(r"^https?://", src):
         info("качаю подписку…")
         blob = http_get(src)
@@ -1090,25 +1091,65 @@ def import_subscription(src):
 
     text = blob.decode("utf-8", errors="replace").strip()
     if "vless://" not in text:
-        pad = text + "=" * (-len(text) % 4)
+        raw = re.sub(r"\s+", "", text)
+        raw += "=" * (-len(raw) % 4)
         try:
-            text = base64.b64decode(pad).decode("utf-8", errors="replace")
+            # и обычный, и url-safe base64
+            text = base64.b64decode(raw.replace("-", "+").replace("_", "/")).decode("utf-8", errors="replace")
         except Exception:
             die("не похоже ни на список ссылок, ни на base64-подписку")
 
     links = [l.strip() for l in text.splitlines() if l.strip().startswith("vless://")]
     if not links:
         die("в подписке нет vless:// ссылок (другие протоколы vlctl не поддерживает)")
+    return links
 
-    added = 0
+
+def import_subscription(src, replace=None):
+    """Импорт подписки. Профили, полученные из того же источника раньше, заменяются.
+    replace: True — удалить и все остальные профили, None — спросить (в меню)."""
+    links = fetch_subscription(src)
+    key = src if re.match(r"^https?://", src) else os.path.abspath(os.path.expanduser(src))
+
+    store = load_store()
+    profs = store["profiles"]
+    subs = store.setdefault("subs", {})
+
+    # Старые хосты этой же подписки выкидываем: их заменит свежий список.
+    for n in subs.get(key, []):
+        profs.pop(n, None)
+
+    others = [n for n, l in profs.items() if l not in links]
+    if others and replace is None:
+        print("  кроме подписки сохранено ещё %d подключений:" % len(others))
+        for n in others:
+            print("    - " + n)
+        replace = confirm("Удалить их и оставить только хосты из новой подписки?", True)
+    if replace:
+        for n in others:
+            profs.pop(n, None)
+        for k in list(subs):
+            subs[k] = [n for n in subs[k] if n in profs]
+
+    names = []
     for link in links:
         try:
-            add_profile(link)
-            added += 1
-        except SystemExit:
+            p = parse_link(link, fatal=False)
+        except ValueError as e:
+            warn(str(e))
             continue
-    info("импортировано %d конфигов -> %s" % (added, STORE))
-    return added
+        name = unique_name(profs, p["name"], link)
+        profs[name] = link
+        names.append(name)
+    subs[key] = names
+    if store.get("last") not in profs:
+        store["last"] = names[0] if names else None
+    save_store(store)
+
+    info("импортировано %d конфигов -> %s" % (len(names), STORE))
+    if others and not replace:
+        info("старые подключения (%d) оставлены; удалить: vlctl import --replace <url>" % len(others))
+    return len(names)
 
 
 def cmd_up(a):
@@ -1165,6 +1206,8 @@ def cmd_rename(a):
     store["profiles"] = {(fresh if k == a.old else k): v for k, v in store["profiles"].items()}
     if store.get("last") == a.old:
         store["last"] = fresh
+    for names in store.get("subs", {}).values():
+        names[:] = [fresh if n == a.old else n for n in names]
     save_store(store)
     info("«%s» -> «%s»" % (a.old, fresh))
     return 0
@@ -1197,7 +1240,7 @@ def cmd_rm(a):
 
 
 def cmd_import(a):
-    import_subscription(a.source)
+    import_subscription(a.source, replace=a.replace)
     return cmd_ls()
 
 
@@ -1254,6 +1297,8 @@ def build_parser():
 
     s = sub.add_parser("import", help="импортировать подписку")
     s.add_argument("source", help="URL или файл")
+    s.add_argument("--replace", action="store_true",
+                   help="удалить все профили, которых нет в этой подписке")
     s.set_defaults(func=cmd_import)
 
     s = sub.add_parser("ls", help="список профилей")
