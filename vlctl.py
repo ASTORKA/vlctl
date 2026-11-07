@@ -35,7 +35,7 @@ import tempfile
 import time
 import urllib.request
 import zipfile
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 HOME = os.path.expanduser("~")
 CFG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "vlctl")
@@ -527,8 +527,8 @@ def arch_tag(kind):
     return a
 
 
-def http_get(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "vlctl"})
+def http_get(url, user_agent="vlctl"):
+    req = urllib.request.Request(url, headers={"User-Agent": user_agent})
     with urllib.request.urlopen(req, timeout=60) as r:
         return r.read()
 
@@ -1080,16 +1080,112 @@ def ui_main(preset_link=None):
 
 # ---------------------------------------------------------------- команды CLI
 
-def fetch_subscription(src):
-    """URL или файл -> список vless:// ссылок."""
-    if re.match(r"^https?://", src):
-        info("качаю подписку…")
-        blob = http_get(src)
-    else:
-        with open(os.path.expanduser(src), "rb") as f:
-            blob = f.read()
+# Многие панели отдают подписку только «своим» клиентам, а остальным — HTML-заглушку.
+# Если с нашим User-Agent ссылок не нашлось, пробуем представиться этими клиентами.
+SUB_USER_AGENTS = ("vlctl", "Happ/2.0", "v2rayNG/1.9.0")
 
+
+def _short_fp(fp):
+    """uTLS-отпечаток из JSON Xray (hellochrome_120) -> вид для ссылки (chrome)."""
+    fp = (fp or "chrome").lower()
+    if fp.startswith("hello"):
+        fp = fp[5:].split("_")[0]
+    return fp or "chrome"
+
+
+def _xray_outbound_link(o, name):
+    """VLESS-outbound из JSON Xray -> (ключ сервера, vless:// ссылка) или None."""
+    s = o.get("settings") or {}
+    if "vnext" in s:  # старый формат: settings.vnext[].users[]
+        v = (s.get("vnext") or [{}])[0]
+        u = (v.get("users") or [{}])[0]
+        s = {"address": v.get("address"), "port": v.get("port"), "id": u.get("id"), "flow": u.get("flow", "")}
+    if not (s.get("address") and s.get("id")):
+        return None
+    ss = o.get("streamSettings") or {}
+    net = ss.get("network") or "tcp"
+    net = "tcp" if net == "raw" else net
+    sec = ss.get("security") or "none"
+    q = [("encryption", "none"), ("type", net), ("security", sec)]
+    if s.get("flow"):
+        q.append(("flow", s["flow"]))
+    if sec == "reality":
+        r = ss.get("realitySettings") or {}
+        q += [("sni", r.get("serverName", "")), ("fp", _short_fp(r.get("fingerprint"))),
+              ("pbk", r.get("publicKey", "")), ("sid", r.get("shortId", "")), ("spx", r.get("spiderX", ""))]
+    elif sec == "tls":
+        t = ss.get("tlsSettings") or {}
+        q += [("sni", t.get("serverName", "")), ("fp", _short_fp(t.get("fingerprint"))),
+              ("alpn", ",".join(t.get("alpn") or []))]
+        if t.get("allowInsecure"):
+            q.append(("allowInsecure", "1"))
+    if net == "ws":
+        w = ss.get("wsSettings") or {}
+        q += [("path", w.get("path", "")), ("host", w.get("host") or (w.get("headers") or {}).get("Host", ""))]
+    elif net == "httpupgrade":
+        h = ss.get("httpupgradeSettings") or {}
+        q += [("path", h.get("path", "")), ("host", h.get("host", ""))]
+    elif net == "grpc":
+        g = ss.get("grpcSettings") or {}
+        q.append(("serviceName", g.get("serviceName", "")))
+    elif net == "xhttp":
+        x = ss.get("xhttpSettings") or {}
+        q += [("path", x.get("path", "")), ("host", x.get("host", ""))]
+    q = [(k, v) for k, v in q if v not in ("", None)]
+    host = str(s["address"])
+    if ":" in host:
+        host = "[%s]" % host
+    query = "&".join("%s=%s" % (k, quote(str(v), safe="/,")) for k, v in q)
+    link = "vless://%s@%s:%s?%s#%s" % (s["id"], host, s.get("port") or 443, query, quote(name, safe=""))
+    d = dict(q)
+    key = (str(s["address"]), s.get("port"), s["id"], net, sec, d.get("sni"), d.get("pbk"), d.get("path"))
+    return key, link
+
+
+def xray_json_links(text):
+    """Подписка в формате JSON-конфигов Xray (Happ, Streisand…) -> vless:// ссылки.
+    Сервер, с которого начинается конфиг, получает его название (remarks),
+    остальные — тег outbound. Одинаковые серверы из разных конфигов склеиваются."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return []
+    configs = data if isinstance(data, list) else [data]
+    configs = [c for c in configs if isinstance(c, dict)]
+
+    def vless_outbounds(c):
+        return [o for o in c.get("outbounds") or [] if isinstance(o, dict) and o.get("protocol") == "vless"]
+
+    titles = {}
+    for c in configs:
+        obs = vless_outbounds(c)
+        if obs and c.get("remarks"):
+            r = _xray_outbound_link(obs[0], "")
+            if r:
+                titles[r[0]] = c["remarks"]  # позже идущий конфиг важнее: «Sweden» поверх «Auto»
+
+    links, seen, chained = [], set(), 0
+    for c in configs:
+        for o in vless_outbounds(c):
+            r = _xray_outbound_link(o, "")
+            if not r or r[0] in seen:
+                continue
+            seen.add(r[0])
+            name = titles.get(r[0]) or o.get("tag") or "%s:%s" % (r[0][0], r[0][1])
+            links.append(_xray_outbound_link(o, name)[1])
+            if (o.get("streamSettings") or {}).get("sockopt", {}).get("dialerProxy"):
+                chained += 1
+    if chained:
+        warn("%d серверов в подписке подключаются цепочкой через другой сервер; "
+             "по отдельной ссылке они могут не работать" % chained)
+    return links
+
+
+def parse_subscription(blob):
+    """Содержимое подписки -> список vless:// ссылок (может быть пустым)."""
     text = blob.decode("utf-8", errors="replace").strip()
+    if text[:1] in "[{":
+        return xray_json_links(text)
     if "vless://" not in text:
         raw = re.sub(r"\s+", "", text)
         raw += "=" * (-len(raw) % 4)
@@ -1097,12 +1193,27 @@ def fetch_subscription(src):
             # и обычный, и url-safe base64
             text = base64.b64decode(raw.replace("-", "+").replace("_", "/")).decode("utf-8", errors="replace")
         except Exception:
-            die("не похоже ни на список ссылок, ни на base64-подписку")
+            return []
+    return [l.strip() for l in text.splitlines() if l.strip().startswith("vless://")]
 
-    links = [l.strip() for l in text.splitlines() if l.strip().startswith("vless://")]
-    if not links:
-        die("в подписке нет vless:// ссылок (другие протоколы vlctl не поддерживает)")
-    return links
+
+def fetch_subscription(src):
+    """URL или файл -> список vless:// ссылок."""
+    if not re.match(r"^https?://", src):
+        with open(os.path.expanduser(src), "rb") as f:
+            links = parse_subscription(f.read())
+        if not links:
+            die("в подписке нет vless:// ссылок: это не список ссылок, не base64 и не JSON Xray")
+        return links
+
+    info("качаю подписку…")
+    for ua in SUB_USER_AGENTS:
+        if ua != SUB_USER_AGENTS[0]:
+            info("ссылок нет, пробую как %s…" % ua.split("/")[0])
+        links = parse_subscription(http_get(src, ua))
+        if links:
+            return links
+    die("в подписке нет vless:// ссылок (сервер отдаёт что-то другое или только другие протоколы)")
 
 
 def import_subscription(src, replace=None):
